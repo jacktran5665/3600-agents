@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from time import sleep
 from typing import List, Set, Tuple
+from collections import deque
 
 import numpy as np
 from game import *
@@ -22,6 +23,11 @@ class PlayerAgent:
         self.last_think = 0.0
         # remember previous location to avoid immediate back-and-forth
         self.prev_loc = None
+        # keep a short history of recent locations to avoid looping
+        self.prev_positions = deque(maxlen=8)
+        # track moves made so we can do a first-move spawn turd if desired
+        self.moves_made = 0
+        self.spawn_turd_placed = False
     
     
     
@@ -78,8 +84,8 @@ class PlayerAgent:
                 allowed_but_own_eggs.append(m)
                 continue
 
-            # avoid immediate backtracking to previous location
-            if self.prev_loc is not None and dest == self.prev_loc:
+            # avoid recent positions (helps prevent multi-step loops)
+            if dest in self.prev_positions:
                 # prefer other moves, but keep as fallback
                 allowed_but_own_eggs.append(m)
                 continue
@@ -168,8 +174,9 @@ class PlayerAgent:
             else:
                 cover = diagonal_coverage(dest)
 
-            # combine with weights: prioritize diagonal coverage, then distance from center/enemy
-            score_val = cover * 5.0 + base * 0.5 + enemy_dist * 0.2
+            # combine with weights: prioritize diagonal coverage (eggs) strongly,
+            # then distance from center/enemy
+            score_val = cover * 8.0 + base * 0.4 + enemy_dist * 0.15
 
             if heard_or_felt:
                 # amplify center avoidance when sensors trigger
@@ -181,27 +188,126 @@ class PlayerAgent:
         plains = [m for m in moves if m[1] == MoveType.PLAIN]
         turds = [m for m in moves if m[1] == MoveType.TURD]
 
-        # Prefer eggs (corner eggs are auto-rewarded by engine). Choose egg that
-        # results in maximal center distance after stepping out.
-        if eggs:
-            # pick egg that maximizes diagonal coverage first
-            best = max(eggs, key=score)
-            result = best
-        elif plains:
-            result = max(plains, key=score)
-        elif turds:
-            # for turds, prefer ones that increase distance from enemy
-            def turd_score(m):
-                dest = dest_for(m)
-                return abs(dest[0] - enemy_loc[0]) + abs(dest[1] - enemy_loc[1])
+        # evaluate opponent mobility now (before any move)
+        try:
+            opp_moves_now = len(board.get_valid_moves(enemy=True))
+        except Exception:
+            opp_moves_now = None
 
-            result = max(turds, key=turd_score)
+        # Consider placing a turd proactively if it protects our spawn or cuts off the
+        # opponent near the center; otherwise prefer eggs then plains.
+        used_turd = False
+        best_turd = None
+        best_turd_score = None
+        best_turd_opp_moves = None
+        if turds and board.chicken_player.get_turds_left() > 0:
+            for m in turds:
+                dest = dest_for(m)
+                spatial = abs(dest[0] - enemy_loc[0]) + abs(dest[1] - enemy_loc[1])
+                try:
+                    board_copy = board.get_copy()
+                    ok = board_copy.apply_move(m[0], m[1], check_ok=True)
+                    if not ok:
+                        continue
+                    board_copy.reverse_perspective()
+                    opp_moves = len(board_copy.get_valid_moves())
+                except Exception:
+                    opp_moves = 999
+
+                score_val = (opp_moves, -spatial)
+                if best_turd_score is None or score_val < best_turd_score:
+                    best_turd_score = score_val
+                    best_turd = m
+                    best_turd_opp_moves = opp_moves
+
+            # decide whether to use a turd: if we're near our spawn or near center, or
+            # if turd dramatically reduces opponent mobility
+            try:
+                my_spawn = board.chicken_player.get_spawn()
+                dist_spawn = abs(my_loc[0] - my_spawn[0]) + abs(my_loc[1] - my_spawn[1])
+            except Exception:
+                dist_spawn = 999
+
+            near_spawn = dist_spawn <= 2
+            near_center = center_dist(my_loc) <= 2.5
+            reduces_opp = (
+                opp_moves_now is not None
+                and best_turd_opp_moves is not None
+                and (opp_moves_now - best_turd_opp_moves) >= 2
+            )
+
+            # Only allow a spawn turd on the very first move and only once
+            allow_spawn_turd = (near_spawn and (not self.spawn_turd_placed) and self.moves_made == 0)
+
+            # require a stronger mobility reduction to justify spending a turd
+            if best_turd is not None and ((allow_spawn_turd) or near_center or reduces_opp):
+                result = best_turd
+                used_turd = True
+                # mark if we placed a turd near spawn
+                if allow_spawn_turd:
+                    self.spawn_turd_placed = True
+
+        if not used_turd:
+            # Prefer eggs (corner eggs are auto-rewarded by engine). Choose egg that
+            # results in maximal diagonal coverage first
+            if eggs:
+                best = max(eggs, key=score)
+                result = best
+            elif plains:
+                result = max(plains, key=score)
+            elif turds:
+                # for turds, choose the one that hurts the opponent most (minimizes their moves)
+                best_turd = None
+                best_turd_score = None
+
+                for m in turds:
+                    # fallback spatial score (distance from enemy)
+                    dest = dest_for(m)
+                    spatial = abs(dest[0] - enemy_loc[0]) + abs(dest[1] - enemy_loc[1])
+
+                    # simulate the move on a copy and evaluate opponent mobility
+                    try:
+                        board_copy = board.get_copy()
+                        ok = board_copy.apply_move(m[0], m[1], check_ok=True)
+                        if not ok:
+                            # invalid on copy; skip
+                            continue
+
+                        # after applying our move, reverse perspective so chicken_player
+                        # represents the original opponent, then count their valid moves
+                        board_copy.reverse_perspective()
+                        opp_moves = len(board_copy.get_valid_moves())
+                    except Exception:
+                        opp_moves = 999
+
+                    # choose move that minimizes opponent moves, tie-break on spatial
+                    score_val = (opp_moves, -spatial)
+                    if best_turd_score is None or score_val < best_turd_score:
+                        best_turd_score = score_val
+                        best_turd = m
+
+                if best_turd is not None:
+                    result = best_turd
+                else:
+                    # fallback to previous heuristic
+                    def turd_score(m):
+                        dest = dest_for(m)
+                        return abs(dest[0] - enemy_loc[0]) + abs(dest[1] - enemy_loc[1])
+
+                    result = max(turds, key=turd_score)
         else:
             result = moves[self.rng.randint(len(moves))]
 
-        # record current location as previous for next turn (helps avoid backtracking)
+        # record current location in history for next turn (helps avoid loops)
         try:
             self.prev_loc = my_loc
+            self.prev_positions.append(my_loc)
+        except Exception:
+            pass
+
+        # increment moves made counter
+        try:
+            self.moves_made += 1
         except Exception:
             pass
 
