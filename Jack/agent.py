@@ -6,6 +6,10 @@ from typing import List, Tuple, Callable
 from game.enums import Direction, MoveType
 from game.game_map import prob_hear, prob_feel
 
+# Weight for rewarding TURD moves that reduce enemy spawn freedom
+SPAWN_CHOKE_WEIGHT = 200
+SPAWN_MOVE_COUNT_WEIGHT = 50
+
 
 class BaseCapitalist:
     def __init__(self, board, time_left: Callable):
@@ -150,10 +154,32 @@ class BaseCapitalist:
 
                 score = self.evaluate_node(next_board, start_eggs)
 
+                # Reward immediate corner egg heavily (unchanged)
                 if move[1] == MoveType.EGG:
                     loc = board.chicken_player.get_location()
                     if (loc[0] in [0, self.map_size - 1] and loc[1] in [0, self.map_size - 1]):
                         score += 2000
+
+                # Extra targeted bonus for TURD moves that demonstrably reduce
+                # enemy's spawn free-neighbor count or reduce enemy's immediate moves.
+                if move[1] == MoveType.TURD:
+                    try:
+                        enemy_spawn = board.chicken_enemy.get_spawn()
+                        before_free = self._count_safe_neighbors(board, enemy_spawn, for_enemy=True)
+                        after_free = self._count_safe_neighbors(next_board, enemy_spawn, for_enemy=True)
+                        delta_free = max(0, before_free - after_free)
+                        if delta_free > 0:
+                            score += SPAWN_CHOKE_WEIGHT * delta_free
+
+                        # also reward direct reduction in enemy available moves
+                        before_moves = len(board.get_valid_moves(enemy=True))
+                        after_moves = len(next_board.get_valid_moves(enemy=True))
+                        delta_moves = max(0, before_moves - after_moves)
+                        if delta_moves > 0:
+                            score += SPAWN_MOVE_COUNT_WEIGHT * delta_moves
+                    except Exception:
+                        # best-effort only; don't crash search on weird forecast behavior
+                        pass
 
                 beam.append((move, next_board, score))
 
@@ -287,7 +313,8 @@ class DominantCapitalist(BaseCapitalist):
         enemy_free = self._count_safe_neighbors(board, enemy_spawn, for_enemy=True)
 
         score += (my_free - 2) * 80
-        score += (2 - enemy_free) * 130
+        # increase spawn-lock weight to favor moves that choke enemy spawn
+        score += (2 - enemy_free) * 190
 
         my_loc = board.chicken_player.get_location()
         risk_here = self.get_trapdoor_risk(my_loc)
@@ -328,7 +355,8 @@ class DominantCapitalist(BaseCapitalist):
 
         if my_turds > 0:
             if 1 <= dist_to_enemy <= 3:
-                score += 140
+                # stronger incentive to be in pressure range when armed
+                score += 190
         else:
             if dist_to_enemy <= 2:
                 score -= 120
@@ -345,13 +373,33 @@ class DominantCapitalist(BaseCapitalist):
         enemy_eggs = board.chicken_enemy.get_eggs_laid()
         losing = my_eggs < enemy_eggs
 
+        # Prefer TURD moves that reduce enemy spawn freedom (compute deltas)
         moves = list(moves)
-        if losing:
-            key_order = {MoveType.TURD: 0, MoveType.EGG: 1, MoveType.PLAIN: 2}
-        else:
-            key_order = {MoveType.EGG: 0, MoveType.PLAIN: 1, MoveType.TURD: 2}
+        enemy_spawn = board.chicken_enemy.get_spawn()
+        before_free = self._count_safe_neighbors(board, enemy_spawn, for_enemy=True)
 
-        moves.sort(key=lambda m: key_order[m[1]])
+        move_delta = {}
+        for m in moves:
+            if m[1] == MoveType.TURD:
+                try:
+                    future = board.forecast_move(m[0], m[1])
+                    if future:
+                        after_free = self._count_safe_neighbors(future, enemy_spawn, for_enemy=True)
+                        move_delta[m] = max(0, before_free - after_free)
+                    else:
+                        move_delta[m] = 0
+                except Exception:
+                    move_delta[m] = 0
+            else:
+                move_delta[m] = 0
+
+        if losing:
+            primary_order = {MoveType.TURD: 0, MoveType.EGG: 1, MoveType.PLAIN: 2}
+        else:
+            primary_order = {MoveType.EGG: 0, MoveType.PLAIN: 1, MoveType.TURD: 2}
+
+        # Sort by (primary_order, -move_delta) so TURDs that choke spawn come first
+        moves.sort(key=lambda m: (primary_order[m[1]], -move_delta.get(m, 0)))
         return moves
 
     def order_inner_moves(self, moves, board):
@@ -367,8 +415,18 @@ class DominantCapitalist(BaseCapitalist):
         my_loc = board.chicken_player.get_location()
         enemy_loc = board.chicken_enemy.get_location()
         dist = self.manhattan_dist(my_loc, enemy_loc)
-
+        # If far, allow turd only if it demonstrably reduces enemy spawn freedom
         if dist > 5:
+            try:
+                future = board.forecast_move(best_move[0], best_move[1])
+                if future:
+                    enemy_spawn = board.chicken_enemy.get_spawn()
+                    before_free = self._count_safe_neighbors(board, enemy_spawn, for_enemy=True)
+                    after_free = self._count_safe_neighbors(future, enemy_spawn, for_enemy=True)
+                    if after_free < before_free:
+                        return best_move
+            except Exception:
+                pass
             return (best_move[0], MoveType.PLAIN)
         return best_move
 
